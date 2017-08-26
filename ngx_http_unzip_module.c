@@ -31,60 +31,58 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <string.h>
-#include <stdio.h>
 #include <zip.h>
 
-static char *ngx_http_unzip(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_unzip_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r);
 
 typedef struct {
-    ngx_flag_t file_in_unzip;
-    ngx_http_complex_value_t *file_in_unzip_archivefile;
-    ngx_http_complex_value_t *file_in_unzip_extract;
+    ngx_flag_t enable;
+    ngx_http_complex_value_t *archive;
+    ngx_http_complex_value_t *target;
+    ngx_flag_t autoindex;
 } ngx_http_unzip_loc_conf_t;
-
 
 /**
  * This module let you keep your files inside zip archive file
  * and serve (unzipping on the fly) them as requested.
  */
 static ngx_command_t ngx_http_unzip_commands[] = {
-    { 
-      ngx_string("file_in_unzip"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
-      ngx_http_unzip,
+    {
+      ngx_string("unzip"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      0,
+      offsetof(ngx_http_unzip_loc_conf_t, enable),
       NULL
-    }, { 
-      ngx_string("file_in_unzip_extract"),
+    }, {
+      ngx_string("unzip_archive"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_extract), 
+      offsetof(ngx_http_unzip_loc_conf_t, archive),
       NULL
-    }, { 
-      ngx_string("file_in_unzip_archivefile"),
+    }, {
+      ngx_string("unzip_path"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_unzip_loc_conf_t, file_in_unzip_archivefile), 
+      offsetof(ngx_http_unzip_loc_conf_t, target),
       NULL
-    }, 
+    }, {
+      ngx_string("unzip_autoindex"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_unzip_loc_conf_t, autoindex),
+      NULL
+    },
     ngx_null_command
 };
 
-/**
- * Create local configuration
- *
- * @param r
- *   Pointer to the request structure.
- * @return
- *   Pointer to the configuration structure.
- */
 static void *
-ngx_http_unzip_create_loc_conf(ngx_conf_t *cf) {
-
+ngx_http_unzip_create_loc_conf(ngx_conf_t *cf)
+{
     ngx_http_unzip_loc_conf_t  *conf;
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_unzip_loc_conf_t));
@@ -92,30 +90,28 @@ ngx_http_unzip_create_loc_conf(ngx_conf_t *cf) {
         return NGX_CONF_ERROR;
     }
 
+    conf->enable = NGX_CONF_UNSET;
+    conf->autoindex = NGX_CONF_UNSET;
+
     return conf;
 }
 
-/**
- * Merge configurations
- *
- * @param r
- *   Pointer to the request structure.
- * @return
- *   Status
- */
 static char *
-ngx_http_unzip_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
-
+ngx_http_unzip_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+{
     ngx_http_unzip_loc_conf_t *prev = parent;
     ngx_http_unzip_loc_conf_t *conf = child;
 
-    if (conf->file_in_unzip_extract == NULL) {
-        conf->file_in_unzip_extract = prev->file_in_unzip_extract;
+    if (conf->target == NULL) {
+        conf->target = prev->target;
     }
 
-    if (conf->file_in_unzip_archivefile == NULL) {
-        conf->file_in_unzip_archivefile = prev->file_in_unzip_archivefile;
+    if (conf->archive == NULL) {
+        conf->archive = prev->archive;
     }
+
+    ngx_conf_merge_value(conf->autoindex, prev->autoindex, 0);
+    ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
     return NGX_CONF_OK;
 }
@@ -123,7 +119,7 @@ ngx_http_unzip_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
 /* The module context. */
 static ngx_http_module_t ngx_http_unzip_module_ctx = {
     NULL, /* preconfiguration */
-    NULL, /* postconfiguration */
+    ngx_http_unzip_init, /* postconfiguration */
 
     NULL, /* create main configuration */
     NULL, /* init main configuration */
@@ -152,35 +148,153 @@ ngx_module_t ngx_http_unzip_module = {
     NGX_MODULE_V1_PADDING
 };
 
-/**
- * Content handler.
- *
- * @param r
- *   Request structure pointer
- * @return
- *   Response status
- */
-static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
+
+static ngx_buf_t *
+ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char *target)
+{
+    ngx_buf_t *b;
+    struct zip_stat st;
+    zip_int64_t total;
+    ngx_array_t entries;
+    ngx_str_t *entry;
+    size_t target_len, st_len, html_len;
+
+    static u_char header[] =
+        "<!DOCTYPE html><html><body><h1>Index</h1>"
+        "<hr><ul><li><a href=\"../\">../</a></li>";
+
+    static u_char footer[] =
+        "</ul><hr></body></html>";
+
+    total = zip_get_num_entries(archive, 0);
+    if (total < 0) {
+        return NULL;
+    }
+
+    if (ngx_array_init(&entries, r->pool, 50, sizeof(ngx_str_t)) != NGX_OK) {
+        return NULL;
+    }
+
+    target_len = ngx_strlen(target);
+    for (zip_int64_t i = 0; i < total; i++) {
+        zip_stat_index(archive, i, 0, &st);
+
+        if (ngx_strncmp(st.name, target, target_len) != 0) {
+            continue;
+        }
+
+        st_len = ngx_strlen(st.name);
+
+        if (st_len <= target_len) {
+            continue;
+        }
+
+        if (ngx_strlchr((u_char *)st.name + target_len, (u_char *)st.name + (st_len - 1), '/')) {
+            continue;
+        }
+
+        entry = ngx_array_push(&entries);
+        if (!entry) {
+            return NULL;
+        }
+
+        entry->len = st_len - target_len;
+        entry->data = ngx_pnalloc(r->pool, entry->len + 1);
+        ngx_cpystrn(entry->data, (u_char *)st.name + target_len, entry->len + 1);
+    }
+
+    html_len = sizeof(header) - 1
+             + sizeof(footer) - 1;
+
+    entry = entries.elts;
+    for (ngx_uint_t i = 0; i < entries.nelts; i++) {
+        html_len += sizeof("<li><a href=\"\"></a></li>") - 1
+                  + entry[i].len * 2;
+    }
+
+    b = ngx_create_temp_buf(r->pool, html_len);
+    if (!b) {
+        return NULL;
+    }
+
+    b->last = ngx_cpymem(b->last, header, sizeof(header) - 1);
+    entry = entries.elts;
+    for (ngx_uint_t i = 0; i < entries.nelts; i++) {
+        b->last = ngx_cpymem(b->last, "<li><a href=\"", sizeof("<li><a href=\"") - 1);
+        b->last = ngx_cpymem(b->last, entry[i].data, entry[i].len);
+        b->last = ngx_cpymem(b->last, "\">", sizeof("\">") - 1);
+        b->last = ngx_cpymem(b->last, entry[i].data, entry[i].len);
+        b->last = ngx_cpymem(b->last, "</a></li>", sizeof("</a></li>") - 1);
+    }
+    b->last = ngx_cpymem(b->last, footer, sizeof(footer) - 1);
+
+    return b;
+}
+
+static ngx_buf_t *
+ngx_http_unzip_deflate(ngx_http_request_t *r, struct zip *archive, const char *target)
 {
     ngx_buf_t   *b;
-    ngx_chain_t out;
-    ngx_str_t   unzip_filename;
-    ngx_str_t   unzip_extract;
-    struct      zip *zip_source;
-    struct      zip_stat zip_st;
-    struct      zip_file *file_in_zip;
-    int         err = 0;
-    char        *unzipfile_path;
-    char        *unzipextract_path;
-    unsigned char *zip_content;
-    unsigned int  zip_read_bytes;
+    struct      zip_stat st;
+    struct      zip_file *file;
+    unsigned char *content;
+    zip_int64_t index;
 
-    ngx_http_unzip_loc_conf_t *unzip_config;
-    unzip_config = ngx_http_get_module_loc_conf(r, ngx_http_unzip_module);
+    index = zip_name_locate(archive, target, 0);
+    if (0 != zip_stat_index(archive, index, 0, &st)) {
+        return NULL;
+    }
+
+    if (!(content = ngx_palloc(r->pool, st.size))) {
+        return NULL;
+    }
+
+    if (!(file = zip_fopen_index(archive, index, 0))) {
+        return NULL;
+    }
+
+    if (zip_fread(file, content, st.size) != (zip_int64_t)st.size) {
+        zip_fclose(file);
+        ngx_pfree(r->pool, content);
+        return NULL;
+    }
+
+    zip_fclose(file);
+
+    /* allocate a new buffer for sending out the reply. */
+    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    if (!b) {
+        return NULL;
+    }
+
+    b->pos = content;
+    b->last = content + st.size;
+
+    return b;
+}
+
+static ngx_int_t
+ngx_http_unzip_handler(ngx_http_request_t *r)
+{
+    ngx_chain_t out;
+    ngx_buf_t  *buf;
+    ngx_str_t   unzip_archive_str;
+    ngx_str_t   unzip_target_str;
+    struct      zip *zip_source;
+    char        *unzip_archive;
+    char        *unzip_target;
+
+    ngx_http_unzip_loc_conf_t *conf;
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_unzip_module);
+
+    /* pass if archive_path or target_path not defined */
+    if (!conf->enable || !conf->target || !conf->archive) {
+        return NGX_DECLINED;
+    }
 
     /* let's try to get file_in_unzip_archivefile and file_in_unzip_extract from nginx configuration */
-    if (ngx_http_complex_value(r, unzip_config->file_in_unzip_archivefile, &unzip_filename) != NGX_OK 
-            || ngx_http_complex_value(r, unzip_config->file_in_unzip_extract, &unzip_extract) != NGX_OK) {
+    if (ngx_http_complex_value(r, conf->archive, &unzip_archive_str) != NGX_OK
+            || ngx_http_complex_value(r, conf->target, &unzip_target_str) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to read unzip module configuration settings.");
         return NGX_ERROR;
     }
@@ -192,141 +306,79 @@ static ngx_int_t ngx_http_unzip_handler(ngx_http_request_t *r)
     }
 
     /* fill path variables with 0 as ngx_string_t doesn't terminate string with 0 */
-    unzipfile_path = malloc(unzip_filename.len+1);
-    if (unzipfile_path == NULL) {
+    unzip_archive = (char *)ngx_palloc(r->pool, unzip_archive_str.len + 1);
+    unzip_target = (char *)ngx_palloc(r->pool, unzip_target_str.len + 1);
+    if (!unzip_archive || !unzip_target) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate buffer.");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-
-    unzipextract_path = malloc(unzip_extract.len+1);
-    if (unzipextract_path == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate buffer.");
-        free(unzipfile_path);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    memset(unzipfile_path, 0, unzip_filename.len+1);
-    memset(unzipextract_path, 0, unzip_extract.len+1);
 
     /* get path variables terminated with 0 */
-    strncpy(unzipfile_path, (char *)unzip_filename.data, unzip_filename.len);
-    strncpy(unzipextract_path, (char *)unzip_extract.data, unzip_extract.len);
+    strncpy(unzip_archive, (char *)unzip_archive_str.data, unzip_archive_str.len);
+    strncpy(unzip_target, (char *)unzip_target_str.data, unzip_target_str.len);
+    unzip_archive[unzip_archive_str.len] = '\0';
+    unzip_target[unzip_target_str.len] = '\0';
 
     /* try to open archive (zip) file */
-    if (!(zip_source = zip_open(unzipfile_path, 0, &err))) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "%s : no such archive file.", unzipfile_path);
-        free(unzipfile_path);
-        free(unzipextract_path);
+    if (!(zip_source = zip_open(unzip_archive, ZIP_CHECKCONS|ZIP_RDONLY, NULL))) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "%s : no such archive.", unzip_archive);
         return NGX_HTTP_NOT_FOUND;
     }
 
-    /* initialize structure */
-    zip_stat_init(&zip_st);
-
-    /* let's check what's the size of a file. return 404 if we can't stat file inside archive */
-    if (0 != zip_stat(zip_source, unzipextract_path, 0, &zip_st)) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "no file %s inside %s archive.", unzipextract_path, unzipfile_path);
-        free(unzipfile_path);
-        free(unzipextract_path);
-        zip_close(zip_source);
-        return NGX_HTTP_NOT_FOUND;
+    if (unzip_target_str.data[unzip_target_str.len - 1] == '/' || unzip_target_str.len == 0) {
+        if (conf->autoindex) {
+            buf = ngx_http_unzip_autoindex(r, zip_source, unzip_target);
+            zip_close(zip_source);
+            if (!buf) {
+                return NGX_ERROR;
+            }
+        } else {
+            zip_close(zip_source);
+            return NGX_HTTP_NOT_FOUND;
+        }
+    } else {
+        buf = ngx_http_unzip_deflate(r, zip_source, unzip_target);
+        if (!buf) {
+            zip_close(zip_source);
+            return NGX_HTTP_NOT_FOUND;
+        }
     }
 
-    /* allocate buffer for the file content */
-    if (!(zip_content = ngx_palloc(r->pool, zip_st.size))) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer memory.");
-        free(unzipfile_path);
-        free(unzipextract_path);
-        zip_close(zip_source);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    buf->memory = 1;
+    buf->last_buf = 1;
+    buf->last_in_chain = 1;
 
-    /* 
-    *  try to open a file that we want - if not return 500 as we know that the file is there (making zip_stat before) 
-    *  so let's return 500.
-    */
-    if (!(file_in_zip = zip_fopen(zip_source, unzipextract_path, 0))) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to open %s from %s archive (corrupted?).",
-                unzipextract_path, unzipfile_path);
-        free(unzipfile_path);
-        free(unzipextract_path);
-        zip_close(zip_source);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* 
-    *  let's get file content and check if we got all
-    *  we're expecting to get zip_st.size bytes so return 500 if we get something else.
-    */
-    if (!(zip_read_bytes = zip_fread(file_in_zip, zip_content, zip_st.size)) || zip_read_bytes != zip_st.size) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "couldn't get %d bytes of %s from %s archive (corrupted?).",
-                zip_st.size, unzipextract_path, unzipfile_path);
-        free(unzipfile_path);
-        free(unzipextract_path);
-        zip_fclose(file_in_zip);
-        zip_close(zip_source);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* close both files */
-    zip_fclose(file_in_zip);
-    zip_close(zip_source);
-
-    /* let's clean */
-    free(unzipfile_path);
-    free(unzipextract_path);
+    out.buf = buf;
+    out.next = NULL; /* just one buffer */
 
     /* set the content-type header. */
     if (ngx_http_set_content_type(r) != NGX_OK) {
-        r->headers_out.content_type.len = sizeof("text/plain") - 1;
-        r->headers_out.content_type.data = (u_char *) "text/plain";
+        ngx_str_set(&r->headers_out.content_type, "text/plain");
+        r->headers_out.content_type_len = r->headers_out.content_type.len;
     }
-
-    /* allocate a new buffer for sending out the reply. */
-    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
-
-    if (b == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer.");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* insertion in the buffer chain. */
-    out.buf = b;
-    out.next = NULL; /* just one buffer */
-
-    b->pos = zip_content;
-    b->last = zip_content + zip_read_bytes;
-    b->memory = 1;
-    b->last_buf = 1;
 
     /* sending the headers for the reply. */
     r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_length_n = zip_read_bytes;
+    r->headers_out.content_length_n = buf->last - buf->pos;
     ngx_http_send_header(r);
 
     return ngx_http_output_filter(r, &out);
-} /* ngx_http_unzip_handler */
+}
 
-/**
- * Configuration setup function that installs the content handler.
- *
- * @param cf
- *   Module configuration structure pointer.
- * @param cmd
- *   Module directives structure pointer.
- * @param conf
- *   Module configuration structure pointer.
- * @return string
- *   Status of the configuration setup.
- */
-static char *ngx_http_unzip(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+static ngx_int_t
+ngx_http_unzip_init(ngx_conf_t *cf)
 {
-    ngx_http_core_loc_conf_t *clcf; /* pointer to core location configuration */
+    ngx_http_handler_pt        *h;
+    ngx_http_core_main_conf_t  *cmcf;
 
-    /* Install the unzip handler. */
-    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    clcf->handler = ngx_http_unzip_handler;
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+    if (!h) {
+        return NGX_ERROR;
+    }
 
-    return NGX_CONF_OK;
-} /* ngx_http_unzip */
+    *h = ngx_http_unzip_handler;
+
+    return NGX_OK;
+}
 
