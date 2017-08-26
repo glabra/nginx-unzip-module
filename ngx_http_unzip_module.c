@@ -30,7 +30,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include <string.h>
 #include <zip.h>
 
 static ngx_int_t ngx_http_unzip_init(ngx_conf_t *cf);
@@ -184,7 +183,6 @@ ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char 
         }
 
         st_len = ngx_strlen(st.name);
-
         if (st_len <= target_len) {
             continue;
         }
@@ -332,8 +330,8 @@ ngx_http_unzip_handler(ngx_http_request_t *r)
     }
 
     /* get path variables terminated with 0 */
-    strncpy(unzip_archive, (char *)unzip_archive_str.data, unzip_archive_str.len);
-    strncpy(unzip_target, (char *)unzip_target_str.data, unzip_target_str.len);
+    ngx_memcpy(unzip_archive, (char *)unzip_archive_str.data, unzip_archive_str.len);
+    ngx_memcpy(unzip_target, (char *)unzip_target_str.data, unzip_target_str.len);
     unzip_archive[unzip_archive_str.len] = '\0';
     unzip_target[unzip_target_str.len] = '\0';
 
@@ -343,23 +341,29 @@ ngx_http_unzip_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_FOUND;
     }
 
+    ngx_uint_t status = NGX_OK;
     if (unzip_target_str.data[unzip_target_str.len - 1] == '/' || unzip_target_str.len == 0) {
+        /* directory listing when uri ends with '/' */
         if (conf->autoindex) {
             buf = ngx_http_unzip_autoindex(r, zip_source, unzip_target);
-            zip_close(zip_source);
+            ngx_str_set(&r->headers_out.content_type, "text/html");
             if (!buf) {
-                return NGX_ERROR;
+                status = NGX_ERROR;
             }
         } else {
-            zip_close(zip_source);
-            return NGX_HTTP_NOT_FOUND;
+            status = NGX_HTTP_NOT_FOUND;
         }
     } else {
         buf = ngx_http_unzip_deflate(r, zip_source, unzip_target);
         if (!buf) {
-            zip_close(zip_source);
-            return NGX_HTTP_NOT_FOUND;
+            status = NGX_HTTP_NOT_FOUND;
         }
+    }
+
+    zip_close(zip_source);
+
+    if (status != NGX_OK) {
+        return status;
     }
 
     buf->memory = 1;
@@ -368,12 +372,6 @@ ngx_http_unzip_handler(ngx_http_request_t *r)
 
     out.buf = buf;
     out.next = NULL; /* just one buffer */
-
-    /* set the content-type header. */
-    if (ngx_http_set_content_type(r) != NGX_OK) {
-        ngx_str_set(&r->headers_out.content_type, "text/plain");
-        r->headers_out.content_type_len = r->headers_out.content_type.len;
-    }
 
     /* sending the headers for the reply. */
     r->headers_out.status = NGX_HTTP_OK;
