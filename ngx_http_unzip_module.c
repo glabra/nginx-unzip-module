@@ -385,6 +385,7 @@ ngx_http_unzip_handler(ngx_http_request_t *r)
         if (conf->autoindex) {
             buf = ngx_http_unzip_autoindex(r, zip_source, unzip_target);
             ngx_str_set(&r->headers_out.content_type, "text/html");
+            r->headers_out.content_type_len = r->headers_out.content_type.len;
             if (!buf) {
                 status = NGX_ERROR;
             }
