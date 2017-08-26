@@ -189,7 +189,25 @@ ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char 
             continue;
         }
 
-        if (ngx_strlchr((u_char *)st.name + target_len, (u_char *)st.name + (st_len - 1), '/')) {
+        const char *path = st.name + target_len;
+        size_t path_len = st_len - target_len;
+
+        char *p = ngx_strchr(path, '/');
+        if (p) {
+            path_len -= ngx_strlen(p + 1);
+        }
+
+        /* TODO: more efficient duplicate check */
+        ngx_int_t matched = 0;
+        entry = entries.elts;
+        for (ngx_uint_t i = 0; i < entries.nelts; i++) {
+            if (ngx_strncmp(path, entry[i].data, entry[i].len) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+
+        if (matched) {
             continue;
         }
 
@@ -198,9 +216,9 @@ ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char 
             return NULL;
         }
 
-        entry->len = st_len - target_len;
-        entry->data = ngx_pnalloc(r->pool, entry->len + 1);
-        ngx_cpystrn(entry->data, (u_char *)st.name + target_len, entry->len + 1);
+        entry->len = path_len;
+        entry->data = ngx_pnalloc(r->pool, entry->len);
+        ngx_memcpy(entry->data, (u_char *)path, entry->len);
     }
 
     html_len = sizeof(header) - 1
@@ -217,16 +235,16 @@ ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char 
         return NULL;
     }
 
-    b->last = ngx_cpymem(b->last, header, sizeof(header) - 1);
+    b->last = ngx_copy(b->last, header, sizeof(header) - 1);
     entry = entries.elts;
     for (ngx_uint_t i = 0; i < entries.nelts; i++) {
-        b->last = ngx_cpymem(b->last, "<li><a href=\"", sizeof("<li><a href=\"") - 1);
-        b->last = ngx_cpymem(b->last, entry[i].data, entry[i].len);
-        b->last = ngx_cpymem(b->last, "\">", sizeof("\">") - 1);
-        b->last = ngx_cpymem(b->last, entry[i].data, entry[i].len);
-        b->last = ngx_cpymem(b->last, "</a></li>", sizeof("</a></li>") - 1);
+        b->last = ngx_copy(b->last, "<li><a href=\"", sizeof("<li><a href=\"") - 1);
+        b->last = ngx_copy(b->last, entry[i].data, entry[i].len);
+        b->last = ngx_copy(b->last, "\">", sizeof("\">") - 1);
+        b->last = ngx_copy(b->last, entry[i].data, entry[i].len);
+        b->last = ngx_copy(b->last, "</a></li>", sizeof("</a></li>") - 1);
     }
-    b->last = ngx_cpymem(b->last, footer, sizeof(footer) - 1);
+    b->last = ngx_copy(b->last, footer, sizeof(footer) - 1);
 
     return b;
 }
