@@ -26,6 +26,14 @@ points to the zipped file, required
 file to be extracted from the zipped file, required
 
 
+### unzip\_path\_encoding
+- **syntax**: `unzip_path_encoding ENCODING`
+- **default**: `""`
+- **context**: http, server, location
+
+character encoding for path in zip.
+
+
 ### unzip\_autoindex
 - **syntax**: `unzip_autoindex [on|off]`
 - **default**: `off`
@@ -52,6 +60,10 @@ location ~ ^/(.+?\.zip)/(.*)$ {
     unzip_path "$2";
     unzip_autoindex on;
     unzip_nocase fallback;
+    unzip_path_encoding "SHIFT_JIS";
 }
 ```
 
+
+## issue
+- On musl libc, cannot set unzip\_path\_encoding like "SHIFT\_JIS". This is [musl libc limitation](http://wiki.musl-libc.org/wiki/Functional_differences_from_glibc).

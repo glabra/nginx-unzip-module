@@ -1,4 +1,26 @@
+if [ -n "$LIBICONV_INC" -a -n "$LIBICONV_LIB" ]; then
+	CORE_LIBS="$CORE_LIBS -lzip -liconv"
+else
+	CORE_LIBS="$CORE_LIBS -lzip -liconv"
+fi
+
 ngx_addon_name=ngx_http_unzip_module
 HTTP_MODULES="$HTTP_MODULES ngx_http_unzip_module"
 NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_unzip_module.c"
 CORE_LIBS="$CORE_LIBS -lzip"
+
+if [ -n "$LIBICONV_INC" -a -n "$LIBICONV_LIB" ]; then
+	case "$NGX_RPATH" in
+		'YES')
+		CORE_LIBS="$CORE_LIBS -R$LIBICONV_LIB -L$LIBICONV_LIB -liconv"
+		;;
+		*)
+		CORE_LIBS="$CORE_LIBS -L$LIBICONV_LIB -liconv"
+		;;
+	esac
+
+	CORE_INCS="$CORE_INCS $LIBICONV_INC"
+else
+	CORE_LIBS="$CORE_LIBS -liconv"
+fi
+

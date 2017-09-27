@@ -2,6 +2,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <zip.h>
+#include <iconv.h>
+#include <errno.h>
 
 #define NGX_HTTP_UNZIP_NOCASE_DISABLE 0
 #define NGX_HTTP_UNZIP_NOCASE_FALLBACK 1
@@ -19,6 +21,7 @@ static ngx_conf_enum_t  ngx_http_unzip_nocase_type[] = {
 
 typedef struct {
     ngx_flag_t enable;
+    ngx_str_t encoding;
     ngx_http_complex_value_t *archive;
     ngx_http_complex_value_t *target;
     ngx_uint_t nocase;
@@ -46,6 +49,13 @@ static ngx_command_t ngx_http_unzip_commands[] = {
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_unzip_loc_conf_t, target),
+      NULL
+    }, {
+      ngx_string("unzip_path_encoding"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_unzip_loc_conf_t, encoding),
       NULL
     }, {
       ngx_string("unzip_nocase"),
@@ -99,6 +109,7 @@ ngx_http_unzip_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->autoindex, prev->autoindex, 0);
     ngx_conf_merge_uint_value(conf->nocase, prev->nocase, NGX_HTTP_UNZIP_NOCASE_DISABLE);
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    ngx_conf_merge_str_value(conf->encoding, prev->encoding, "");
 
     return NGX_CONF_OK;
 }
@@ -235,32 +246,36 @@ ngx_http_unzip_autoindex(ngx_http_request_t *r, struct zip *archive, const char 
     return b;
 }
 
-static ngx_buf_t *
-ngx_http_unzip_inflate(ngx_http_request_t *r, struct zip *archive, const char *target)
+static zip_int64_t
+ngx_http_unzip_inflate_getindex(ngx_http_unzip_loc_conf_t *conf, struct zip *archive, const char *path, zip_flags_t flags)
 {
-    ngx_buf_t   *b;
-    struct      zip_stat st;
-    struct      zip_file *file;
-    unsigned char *content;
     zip_int64_t index;
-
-    ngx_http_unzip_loc_conf_t *conf;
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_unzip_module);
 
     switch (conf->nocase) {
     case NGX_HTTP_UNZIP_NOCASE_FALLBACK:
-        index = zip_name_locate(archive, target, 0);
+        index = zip_name_locate(archive, path, flags);
         if (index < 0) {
-            index = zip_name_locate(archive, target, ZIP_FL_NOCASE);
+            index = zip_name_locate(archive, path, ZIP_FL_NOCASE|flags);
         }
         break;
     case NGX_HTTP_UNZIP_NOCASE_ALWAYS:
-        index = zip_name_locate(archive, target, ZIP_FL_NOCASE);
+        index = zip_name_locate(archive, path, ZIP_FL_NOCASE|flags);
         break;
     default: /* NGX_HTTP_UNZIP_NOCASE_DISABLE */
-        index = zip_name_locate(archive, target, 0);
+        index = zip_name_locate(archive, path, flags);
         break;
     }
+
+    return index;
+}
+
+static ngx_buf_t *
+ngx_http_unzip_inflate_unpack(ngx_http_request_t *r, struct zip *archive, zip_int64_t index)
+{
+    ngx_buf_t   *b;
+    unsigned char *content;
+    struct      zip_stat st;
+    struct      zip_file *file;
 
     if (0 != zip_stat_index(archive, index, 0, &st)) {
         return NULL;
@@ -271,6 +286,7 @@ ngx_http_unzip_inflate(ngx_http_request_t *r, struct zip *archive, const char *t
     }
 
     if (!(file = zip_fopen_index(archive, index, 0))) {
+        ngx_pfree(r->pool, content);
         return NULL;
     }
 
@@ -292,6 +308,58 @@ ngx_http_unzip_inflate(ngx_http_request_t *r, struct zip *archive, const char *t
     b->last = content + st.size;
 
     return b;
+}
+
+static ngx_buf_t *
+ngx_http_unzip_inflate(ngx_http_request_t *r, struct zip *archive, ngx_str_t *target)
+{
+    zip_int64_t index;
+    ngx_http_unzip_loc_conf_t *conf;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_unzip_module);
+
+    char *path = (char *)ngx_palloc(r->pool, target->len + 1);
+    ngx_memcpy(path, (char *)target->data, target->len);
+    path[target->len] = '\0';
+    index = ngx_http_unzip_inflate_getindex(conf, archive, path, 0);
+    ngx_pfree(r->pool, path);
+
+    if (index == -1 && conf->encoding.len > 0) {
+        iconv_t cd;
+        char *inbuf, *outbuf, *enc;
+        size_t in_s, out_size, out_s;
+
+        in_s = target->len;
+        out_size = in_s * 6; /* assign plenty memory for converted string */
+        out_s = out_size;
+
+        inbuf = (char *)ngx_palloc(r->pool, in_s + 1);
+        outbuf = (char *)ngx_palloc(r->pool, out_s);
+        enc = (char *)ngx_palloc(r->pool, conf->encoding.len + 1);
+        if (!inbuf || !outbuf || !enc) {
+            return NULL;
+        }
+
+        ngx_memcpy(inbuf, (char *)target->data, target->len);
+        inbuf[target->len] = '\0';
+        ngx_memcpy(enc, (char *)conf->encoding.data, conf->encoding.len);
+        enc[conf->encoding.len] = '\0';
+
+        cd = iconv_open(enc, "UTF-8");
+        if (cd != (iconv_t) - 1) {
+            if (iconv(cd, &inbuf, &in_s, &outbuf, &out_s) != (size_t) - 1) {
+                *outbuf = '\0';
+                index = ngx_http_unzip_inflate_getindex(conf, archive, outbuf - (out_size - out_s), ZIP_FL_ENC_RAW);
+            }
+        }
+
+        iconv_close(cd);
+        ngx_pfree(r->pool, outbuf);
+        ngx_pfree(r->pool, enc);
+        ngx_pfree(r->pool, inbuf);
+    }
+
+    return ngx_http_unzip_inflate_unpack(r, archive, index);
 }
 
 static ngx_int_t
@@ -360,7 +428,7 @@ ngx_http_unzip_handler(ngx_http_request_t *r)
             status = NGX_HTTP_NOT_FOUND;
         }
     } else {
-        buf = ngx_http_unzip_inflate(r, zip_source, unzip_target);
+        buf = ngx_http_unzip_inflate(r, zip_source, &unzip_target_str);
         if (!buf) {
             status = NGX_HTTP_NOT_FOUND;
         }
