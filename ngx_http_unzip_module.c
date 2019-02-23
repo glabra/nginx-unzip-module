@@ -3,7 +3,6 @@
 #include <ngx_http.h>
 #include <zip.h>
 #include <iconv.h>
-#include <errno.h>
 
 #define NGX_HTTP_UNZIP_NOCASE_DISABLE 0
 #define NGX_HTTP_UNZIP_NOCASE_FALLBACK 1
@@ -326,30 +325,35 @@ ngx_http_unzip_inflate(ngx_http_request_t *r, struct zip *archive, ngx_str_t *ta
 
     if (index == -1 && conf->encoding.len > 0) {
         iconv_t cd;
-        char *inbuf, *outbuf, *enc;
-        size_t in_s, out_size, out_s;
+        u_char *inbuf;
+        char *outbuf, *enc;
+        size_t in_s, out_s;
 
-        in_s = target->len;
-        out_size = in_s * 6; /* assign plenty memory for converted string */
-        out_s = out_size;
+        out_s = target->len * 6; /* assign plenty memory for converted string */
 
-        inbuf = (char *)ngx_palloc(r->pool, in_s + 1);
+        inbuf = (u_char *)ngx_palloc(r->pool, target->len);
         outbuf = (char *)ngx_palloc(r->pool, out_s);
         enc = (char *)ngx_palloc(r->pool, conf->encoding.len + 1);
         if (!inbuf || !outbuf || !enc) {
             return NULL;
         }
 
-        ngx_memcpy(inbuf, (char *)target->data, target->len);
-        inbuf[target->len] = '\0';
+        u_char *src = target->data;
+	u_char *dst = inbuf;
+        ngx_unescape_uri(&dst, &src, target->len, NGX_UNESCAPE_URI);
+	in_s = dst - inbuf;
+
         ngx_memcpy(enc, (char *)conf->encoding.data, conf->encoding.len);
         enc[conf->encoding.len] = '\0';
 
         cd = iconv_open(enc, "UTF-8");
         if (cd != (iconv_t) - 1) {
-            if (iconv(cd, &inbuf, &in_s, &outbuf, &out_s) != (size_t) - 1) {
-                *outbuf = '\0';
-                index = ngx_http_unzip_inflate_getindex(conf, archive, outbuf - (out_size - out_s), ZIP_FL_ENC_RAW);
+            char *inbufc = (char *)inbuf;
+            char *out = outbuf;
+            if (iconv(cd, &inbufc, &in_s, &out, &out_s) != (size_t) - 1) {
+                *out = '\0';
+ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "iconv end; %s", outbuf);
+                index = ngx_http_unzip_inflate_getindex(conf, archive, outbuf, ZIP_FL_ENC_RAW);
             }
         }
 
